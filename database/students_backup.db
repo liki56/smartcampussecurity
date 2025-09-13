@@ -1,0 +1,6 @@
+CREATE TABLE students (
+    sr_no TEXT PRIMARY KEY,
+    name TEXT,
+    photo_path TEXT,
+    id_card_path TEXT
+);

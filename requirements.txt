@@ -1,0 +1,8 @@
+opencv-python
+numpy
+face_recognition
+pillow
+pytesseract
+imutils
+easyocr 
+RPi.GPIO  
