@@ -1,12 +1,15 @@
 # main.py
-import cv2, pickle, os, time
-from scripts.id_ocr import detect_card_and_crop, ocr_text, extract_card_face_encoding
+import cv2, threading
+import face_recognition
+import numpy as np
+
 from scripts.database_utils import load_all_students
-from scripts.gate_control import init_hardware, open_gate, alert_buzzer
-import face_recognition, numpy as np
+from scripts.gate_control import init_hardware, open_gate, alert_buzzer, cleanup
+from scripts.siren_alert import play_siren  # Siren sound module
 
 # Load DB students
 students = load_all_students()
+
 # Flatten encodings for quick matching
 known_encodings = []
 known_usns = []
@@ -15,86 +18,107 @@ for s in students:
         known_encodings.append(e)
         known_usns.append(s['usn'])
 
+# Threshold for face recognition
 TOL_FACE = 0.50
-TOL_CARD_PHOTO = 0.50
 
+# Initialize hardware
 init_hardware()
+
+# Start webcam
 cap = cv2.VideoCapture(0)
-print("Starting main loop. Press q to quit.")
+if not cap.isOpened():
+    print("❌ Cannot open webcam")
+    exit()
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        continue
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    face_locs = face_recognition.face_locations(rgb, model='hog')
-    face_encs = face_recognition.face_encodings(rgb, face_locs)
-    for (top,right,bottom,left), face_enc in zip(face_locs, face_encs):
-        # match face
-        dists = face_recognition.face_distance(known_encodings, face_enc)
-        if len(dists)==0:
+print("Starting main loop. Press 'q' to quit.")
+
+# Serial number tracking for access granted
+serial_counter = 1
+serial_mapping = {}  # usn -> serial no
+label_timers = {}    # usn -> remaining frames
+LABEL_FRAMES = 30    # ~1 second at 30 FPS
+
+# Track unknown faces to prevent repeated siren
+recent_unknowns = set()
+SIREN_COOLDOWN_FRAMES = 30
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locs = face_recognition.face_locations(rgb, model='hog')
+        face_encs = face_recognition.face_encodings(rgb, face_locs)
+
+        # Temporary set to track current frame unknowns
+        current_frame_unknowns = set()
+
+        for (top, right, bottom, left), face_enc in zip(face_locs, face_encs):
+            # Check if face matches known IDs
             match_usn = None
-            name_label = "Unknown"
-        else:
-            i = np.argmin(dists)
-            if dists[i] <= TOL_FACE:
-                match_usn = known_usns[i]
-                name_label = match_usn
+            if len(known_encodings) > 0:
+                dists = face_recognition.face_distance(known_encodings, face_enc)
+                i = np.argmin(dists)
+                if dists[i] <= TOL_FACE:
+                    match_usn = known_usns[i]
+
+            if match_usn:  # ✅ Known ID
+                if match_usn not in serial_mapping:
+                    serial_mapping[match_usn] = serial_counter
+                    serial_counter += 1
+                serial_no = serial_mapping[match_usn]
+
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                cv2.putText(frame, f"{match_usn} - ACCESS GRANTED", (left, top - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                print(f"✅ ACCESS GRANTED for {match_usn} (Serial {serial_no})")
+                open_gate(duration=2)
+                label_timers[match_usn] = LABEL_FRAMES
+
+            else:  # ❌ Unknown ID
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+                cv2.putText(frame, "UNKNOWN - ACCESS DENIED", (left, top - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                print("❌ ACCESS DENIED - Unknown ID")
+                alert_buzzer(duration=1)
+
+                # Use face coordinates as temporary ID
+                face_id = (top, right, bottom, left)
+                current_frame_unknowns.add(face_id)
+
+                if face_id not in recent_unknowns:
+                    threading.Thread(target=play_siren, daemon=True).start()
+                    recent_unknowns.add(face_id)
+
+        # Update recent_unknowns
+        recent_unknowns = recent_unknowns.intersection(current_frame_unknowns)
+
+        # Show persistent access labels
+        for usn in list(label_timers.keys()):
+            if label_timers[usn] > 0:
+                cv2.putText(frame, f"{usn}: Access Granted ✅",
+                            (20, 30 + 30*list(label_timers.keys()).index(usn)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                label_timers[usn] -= 1
             else:
-                match_usn = None
-                name_label = "Unknown"
+                del label_timers[usn]
 
-        # Draw face box
-        cv2.rectangle(frame, (left,top), (right,bottom), (0,255,0), 2)
-        cv2.putText(frame, name_label, (left, top-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        # Display frame safely
+        try:
+            cv2.imshow("SmartGate", frame)
+        except cv2.error:
+            pass
 
-        # Try detect ID card in area below face (heuristic)
-        roi_y_start = bottom
-        roi_y_end = min(frame.shape[0], bottom + 300)
-        roi_x_start = max(0, left - 50)
-        roi_x_end = min(frame.shape[1], right + 50)
-        roi = frame[roi_y_start:roi_y_end, roi_x_start:roi_x_end]
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-        if roi.size != 0:
-            card_crop, bbox = detect_card_and_crop(roi)
-            if card_crop is not None:
-                cx,cy,cw,ch = bbox
-                # Draw card box on main frame
-                cv2.rectangle(frame, (roi_x_start+cx, roi_y_start+cy), (roi_x_start+cx+cw, roi_y_start+cy+ch), (255,0,0), 2)
-                # OCR text
-                text = ocr_text(card_crop)
-                card_enc = extract_card_face_encoding(card_crop)
-
-                # Verification logic:
-                card_ok = False
-                face_ok = False
-                # check OCR contains matched USN or name (simple substring match)
-                if match_usn:
-                    # find student record from students
-                    srec = next((s for s in students if s['usn'] == match_usn), None)
-                    if srec:
-                        # check OCR vs DB text
-                        if srec['usn'].lower() in text.lower() or srec['name'].lower() in text.lower():
-                            card_ok = True
-                        # compare card photo to student's encodings
-                        if card_enc is not None:
-                            dists_card = face_recognition.face_distance(srec['encodings'], card_enc)
-                            if len(dists_card)>0 and min(dists_card) <= TOL_CARD_PHOTO:
-                                face_ok = True
-
-                # Decision
-                if match_usn and card_ok and face_ok:
-                    cv2.putText(frame, "ACCESS GRANTED", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
-                    print("ACCESS GRANTED for", match_usn)
-                    open_gate(duration=2)
-                else:
-                    cv2.putText(frame, "ACCESS DENIED", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
-                    print("ACCESS DENIED. match_usn:", match_usn, "card_ok:", card_ok, "face_ok:", face_ok)
-                    alert_buzzer(duration=1)
-
-    cv2.imshow("SmartGate", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+finally:
+    cap.release()
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
+    cleanup()
+    print("System exited cleanly.")
